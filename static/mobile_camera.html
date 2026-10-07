@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Garbha AI - Microscope Camera</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #111;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    .header {
+      width: 100%;
+      padding: 12px 16px;
+      background: #1a1a2e;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .header h1 {
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .status {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #333;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f44;
+      display: inline-block;
+    }
+
+    .status.connected .dot {
+      background: #4f4;
+    }
+
+    .status.streaming .dot {
+      background: #4f4;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.4;
+      }
+    }
+
+    .video-container {
+      flex: 1;
+      width: 100%;
+      position: relative;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .overlay {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .controls {
+      width: 100%;
+      padding: 16px;
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+    }
+
+    .btn {
+      flex: 1;
+      padding: 14px;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-start {
+      background: #4CAF50;
+      color: #fff;
+    }
+
+    .btn-stop {
+      background: #f44336;
+      color: #fff;
+    }
+
+    .btn-switch {
+      background: #2196F3;
+      color: #fff;
+    }
+
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    select {
+      width: 100%;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #444;
+      background: #222;
+      color: #fff;
+      font-size: 14px;
+    }
+
+    .stats {
+      width: 100%;
+      padding: 8px 16px;
+      background: #0d0d1a;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-around;
+    }
+
+    .stat-item {
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 700;
+      color: #4CAF50;
+    }
+
+    .calibration-warning {
+      display: none;
+      width: 100%;
+      padding: 8px 16px;
+      background: #3a2a00;
+      color: #ffd27a;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .stat-label {
+      color: #888;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="header">
+    <h1>Garbha AI - Microscope</h1>
+    <div class="status" id="status">
+      <span class="dot"></span>
+      <span id="statusText">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="video-container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+    <div class="overlay" id="overlay">
+      <div>FPS: <span id="fpsDisplay">0</span></div>
+      <div>Sent: <span id="frameCount">0</span></div>
+    </div>
+  </div>
+
+  <div class="calibration-warning" id="calibrationWarning"></div>
+  <div class="stats" id="statsBar" style="display:none;">
+    <div class="stat-item">
+      <div class="stat-value" id="statTracked">0</div>
+      <div class="stat-label">Tracked</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statActive">0</div>
+      <div class="stat-label">Active</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statProgressive">0</div>
+      <div class="stat-label">Progressive</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statFps">0</div>
+      <div class="stat-label">Server FPS</div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <select id="resSelect">
+      <option value="640x480">640 x 480 (Fast)</option>
+      <option value="1280x720" selected>1280 x 720 (HD)</option>
+      <option value="1920x1080">1920 x 1080 (Full HD)</option>
+    </select>
+    <div class="btn-row">
+      <button class="btn btn-start" id="btnStart" onclick="startStreaming()">Start Streaming</button>
+      <button class="btn btn-stop" id="btnStop" onclick="stopStreaming()" disabled>Stop</button>
+    </div>
+    <button class="btn btn-switch" id="btnSwitch" onclick="switchCamera()">Switch Camera</button>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    let ws = null;
+    let stream = null;
+    let sendInterval = null;
+    let frameCount = 0;
+    let facingMode = 'environment'; // rear camera by default (microscope)
+    let isStreaming = false;
+
+    // Get server address from the host that served this page.
+    // This page is served from the GPU VM at /static/mobile_camera.html
+    // The WebSocket endpoint is on the same server at /live/ws/{session}
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('session') || 'default';
+    const serverHost = window.location.host;
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${serverHost}/live/ws/${sessionId}`;
+
+    function getResolution() {
+      const val = document.getElementById('resSelect').value;
+      const [w, h] = val.split('x').map(Number);
+      return { width: w, height: h };
+    }
+
+    async function startCamera() {
+      const res = getResolution();
+      const constraints = {
+        video: {
+          facingMode: facingMode,
+          width: { ideal: res.width },
+          height: { ideal: res.height },
+          frameRate: { ideal: 30 }
+        },
+        audio: false
+      };
+
+      try {
+        if (stream) {
+          stream.getTracks().forEach(t => t.stop());
+        }
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+
+        // Set canvas to actual video dimensions
+        const track = stream.getVideoTracks()[0];
+        const settings = track.getSettings();
+        canvas.width = settings.width || res.width;
+        canvas.height = settings.height || res.height;
+
+        return true;
+      } catch (err) {
+        alert('Camera access denied or not available: ' + err.message);
+        return false;
+      }
+    }
+
+    function connectWebSocket() {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          setStatus('connected');
+          // Send initial config
+          ws.send(JSON.stringify({
+            type: 'config',
+            width: canvas.width,
+            height: canvas.height,
+            fps: 30
+          }));
+          resolve();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'stats') {
+              updateStats(data);
+            } else if (data.type === 'disconnect') {
+              // Server closed the session (user clicked Disconnect in UI)
+              alert('Session ended: ' + (data.reason || 'Disconnected by user'));
+              stopStreaming();
+            }
+          } catch (e) { }
+        };
+
+        ws.onerror = (err) => {
+          console.error('WebSocket error:', err);
+          alert('WebSocket connection failed!\n\nURL: ' + wsUrl + '\n\nMake sure the server is running with SSL.');
+          reject(err);
+        };
+
+        ws.onclose = (event) => {
+          setStatus('disconnected');
+          if (!event.wasClean) {
+            document.getElementById('overlay').innerHTML =
+              '<div style="color:red">WS closed: code=' + event.code + ' reason=' + (event.reason || 'none') + '</div>' +
+              '<div>URL: ' + wsUrl + '</div>';
+          }
+          if (isStreaming) {
+            setTimeout(() => {
+              if (isStreaming) {
+                connectWebSocket().then(startSending).catch(() => stopStreaming());
+              }
+            }, 2000);
+          }
+        };
+      });
+    }
+
+    function startSending() {
+      let lastTime = performance.now();
+      let fpsCounter = 0;
+
+      const targetFps = 15; // send 15 frames/sec to balance quality vs bandwidth
+      const interval = 1000 / targetFps;
+
+      sendInterval = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (video.readyState < 2) return;
+
+        // Draw video frame to canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Encode as JPEG and send as binary
+        canvas.toBlob((blob) => {
+          if (blob && ws && ws.readyState === WebSocket.OPEN) {
+            blob.arrayBuffer().then(buf => {
+              ws.send(buf);
+              frameCount++;
+              fpsCounter++;
+              document.getElementById('frameCount').textContent = frameCount;
+            });
+          }
+        }, 'image/jpeg', 0.8);
+
+        // Update FPS display
+        const now = performance.now();
+        if (now - lastTime >= 1000) {
+          document.getElementById('fpsDisplay').textContent = fpsCounter;
+          fpsCounter = 0;
+          lastTime = now;
+        }
+      }, interval);
+    }
+
+    // Show connection info for debugging
+    document.getElementById('overlay').innerHTML =
+      '<div>WS: ' + wsUrl + '</div>' +
+      '<div>Session: ' + sessionId + '</div>';
+
+    async function startStreaming() {
+      document.getElementById('btnStart').disabled = true;
+
+      const camOk = await startCamera();
+      if (!camOk) {
+        document.getElementById('btnStart').disabled = false;
+        return;
+      }
+
+      try {
+        await connectWebSocket();
+      } catch (e) {
+        alert('Cannot connect to server. Make sure the server is running.');
+        document.getElementById('btnStart').disabled = false;
+        return;
+      }
+
+      isStreaming = true;
+      startSending();
+      setStatus('streaming');
+
+      document.getElementById('btnStop').disabled = false;
+      document.getElementById('statsBar').style.display = 'flex';
+    }
+
+    function stopStreaming() {
+      isStreaming = false;
+
+      if (sendInterval) {
+        clearInterval(sendInterval);
+        sendInterval = null;
+      }
+
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+
+      video.srcObject = null;
+      frameCount = 0;
+      setStatus('disconnected');
+
+      document.getElementById('btnStart').disabled = false;
+      document.getElementById('btnStop').disabled = true;
+      document.getElementById('statsBar').style.display = 'none';
+    }
+
+    async function switchCamera() {
+      facingMode = facingMode === 'environment' ? 'user' : 'environment';
+      if (isStreaming) {
+        await startCamera();
+      }
+    }
+
+    function setStatus(state) {
+      const el = document.getElementById('status');
+      const text = document.getElementById('statusText');
+      el.className = 'status ' + state;
+      const labels = {
+        'disconnected': 'Disconnected',
+        'connected': 'Connected',
+        'streaming': 'Streaming'
+      };
+      text.textContent = labels[state] || state;
+    }
+
+    function updateStats(data) {
+      document.getElementById('statTracked').textContent = data.total_tracked || 0;
+      document.getElementById('statActive').textContent = data.active_count || 0;
+      document.getElementById('statProgressive').textContent =
+        (data.motility && data.motility.progressive) || 0;
+      document.getElementById('statFps').textContent = data.fps_actual || 0;
+      const warning = document.getElementById('calibrationWarning');
+      const unit = data.velocity_unit ? ' Velocity unit: ' + data.velocity_unit + '.' : '';
+      if (data.calibration_warning) {
+        warning.style.display = 'block';
+        warning.textContent = data.calibration_warning + unit;
+      } else if (data.velocity_unit) {
+        warning.style.display = 'block';
+        warning.textContent = 'Velocity unit: ' + data.velocity_unit + '.';
+      } else {
+        warning.style.display = 'none';
+        warning.textContent = '';
+      }
+    }
+  </script>
+</body>
+
+</html>

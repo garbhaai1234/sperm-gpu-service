@@ -1,0 +1,10 @@
+uploads/
+config.ini
+ssl/
+node_modules/
+.venv/
+dist/
+build/
+*.log
+.env
+outputs/
