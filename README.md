@@ -462,3 +462,104 @@ Developer rules: preserve biological identity; prevent sperm-to-sperm transfers 
 | Tests | Three test modules present; execution/pass count not checked | tests/ |
 
 **Platform/repository discrepancy:** Garbha’s official website describes a broader platform and calls its sperm assessment module “In Validation.” This repository verifies a sperm-video code path, not the validation or clinical status of that platform module. Edge inference, privacy architecture, hardware integration, website performance figures, sperm vitality/DNA-integrity scoring, and other IVF modules are **Not verified from the current implementation.**
+
+## Coordinate grid tracking diagnostics for uploaded videos
+
+Every uploaded inference pass now writes `meta/grid_tracking_coordinates.csv` and
+`meta/grid_tracking_coordinates.json`. These are read-only diagnostics of the
+existing canonical `application_id`; grid cells never assign, merge, recover or
+retire identities. Existing tracking thresholds, morphology and CASA formulas
+are unchanged. This feature does not fix or prove biological ID switching.
+
+The coordinate system is the **original source frame**, origin top-left, X right,
+Y down, in pixels. Observations use `(x1+x2)/2, (y1+y2)/2`, exactly the canonical
+bbox center used by uploaded CASA, not the mask centroid. Low-score identity
+support is included in diagnostics with its assignment/state but still excluded
+from CASA by the existing rules. Unassigned observations retain a null ID (`ID ?`
+on video). High-score observations excluded before linking are also logged
+without an invented identity. Detections below the existing minimum confidence
+filter are not available to this layer.
+
+Configure through `[pipeline]` in `config.ini` or the corresponding environment
+variables (environment wins):
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| `show_tracking_grid` | `SPERM_PIPELINE_SHOW_TRACKING_GRID` | `false` |
+| `grid_rows` | `SPERM_PIPELINE_GRID_ROWS` | `8` |
+| `grid_columns` | `SPERM_PIPELINE_GRID_COLUMNS` | `8` |
+| `grid_history_length` | `SPERM_PIPELINE_GRID_HISTORY_LENGTH` | `40` source frames |
+
+These are also constructor arguments to `SpermAnalysisPipeline`. Restart the
+service to apply environment/configuration changes. When enabled, a **separate**
+`output_grid_tracking_video.mp4` is generated from the original frames, with grid,
+canonical ID, X/Y, cell, state, overlap-group membership, and recent trails.
+Standard inference/processed videos remain unchanged. Encoding uses the existing
+FFmpeg conversion helper; if FFmpeg fails/unavailable, the returned video path is
+the AVI fallback instead of falsely advertising an MP4.
+
+Cell indices are zero-based in CSV/JSON, with column letters and one-based row
+labels: top-left `A1`, next column `B1`; columns beyond Z use AA, AB, etc.
+`cell_width=W/columns`, `cell_height=H/rows`,
+`col=min(int(x/cell_width),columns-1)` and
+`row=min(int(y/cell_height),rows-1)`. For valid source points, `0<=x<W` and
+`0<=y<H`. Out-of-image tracker coordinates are retained exactly with
+`in_frame=false` and null cell, and are not drawn or silently clamped into the
+image. This preserves evidence rather than changing the tracking point.
+
+Logs contain job ID, source frame/time, canonical and underlying IDs, full-precision
+X/Y, grid cell, confidence, bbox, identity state, observed/predicted provenance,
+previous observed cell, distance from the last observed point, assignment/reason,
+and overlap groups. JSON additionally contains video/configuration metadata and
+lifecycle/advisory events. Empty frames have a `NO_OBSERVATIONS` row. No detection
+confidence or observed bbox is invented for predictions. `movement_distance` for
+a prediction is displacement from the last observation, not measured movement.
+
+- `observed`: detector-associated bbox, including ByteTrack's tracked bbox.
+- `predicted`: existing identity predictor for LOST/OCCLUDED/UNRESOLVED identities;
+  yellow dashed circle and explicit `PREDICTED`. Never enters observed trails or CASA.
+- CSRT image-tracker updates between detector frames are also `predicted`, with
+  dashed markers and null detection confidence; no fabricated ByteTrack ID. CSRT association/behavior is unchanged. Its tracker
+  does not expose the default linker's overlap lifecycle, so those events are not
+  invented for CSRT.
+
+Trails are bounded by source-frame age and do not connect across missing frames.
+The overlay rounds displayed coordinates to two decimal places; exports retain
+full precision. Dense scenes can have overlapping text; coordinate lookup is the
+unobscured diagnostic source.
+
+`POSSIBLE_ID_SWITCH` flags large jumps (>300 px/s by default), unexplained ByteTrack
+association changes, or paired direction reversals (cosine <−0.7) within a shared
+current overlap group. `POSSIBLE_FRAGMENTATION` flags new IDs within 40 px and
+1 second of a recently absent ID. Recovery labels also preserve actual tracker
+lifecycle events. These are **advisory heuristics, not biological ground truth**;
+thresholds are independent `GridConfig` diagnostic settings and never affect the
+tracker. Proximity can indicate genuinely different sperm. Missing detections
+and ambiguous observations remain visible as uncertainty.
+
+`GET /results/{job_id}` adds nullable `grid_tracking_video`, `grid_tracking_csv`,
+and `grid_tracking_json` URLs; existing fields are unchanged. The existing
+API-key-protected output route serves these files. Coordinate search:
+
+```text
+GET /diagnostics/{job_id}/sperm/7
+X-API-Key: <configured service key>
+```
+
+Returns first/last observed frame, coordinate/grid histories, observed trajectory,
+ByteTrack history and overlap/lost/recovery/advisory events for canonical ID 7.
+Missing job artifacts or identities return 404; invalid paths are rejected. No
+uploaded dashboard source is present in this checkout, so clients consume these
+additive URLs through the existing result API; the live mobile page is unchanged.
+
+Tests: `tests/test_grid_tracking.py`. Three-source-video validation runner:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sperm_pipeline python tests/validate_grid_videos.py
+```
+
+It reruns the inference/morphology/CASA pass with grid video off/on for the three
+existing original uploads, checks every canonical CSV coordinate, source video
+geometry/FPS/frame count, identity trails, recovery events, exact analysis equality,
+and standard-video hashes. It does not rerun the independent diagnostic YOLO
+processed-video pass. See `docs/GRID_TRACKING_VALIDATION.md` for recorded results.

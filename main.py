@@ -40,6 +40,7 @@ if _pipeline_parent not in sys.path:
     sys.path.insert(0, _pipeline_parent)
 
 from sperm_pipeline import SpermAnalysisPipeline, LiveStreamProcessor
+from sperm_pipeline.grid_tracking import coordinate_history
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,6 +98,11 @@ TRACKING_METHOD = _cfg("pipeline", "tracking_method", "distance").strip().lower(
 DETECTOR_INTERVAL = int(_cfg("pipeline", "detector_interval", "10"))
 _um_per_px = _cfg("pipeline", "micrometers_per_pixel", "").strip()
 MICROMETERS_PER_PIXEL = float(_um_per_px) if _um_per_px else None
+
+SHOW_TRACKING_GRID = _cfg("pipeline", "show_tracking_grid", "false").lower() in {"1", "true", "yes", "on"}
+GRID_ROWS = int(_cfg("pipeline", "grid_rows", "8"))
+GRID_COLUMNS = int(_cfg("pipeline", "grid_columns", "8"))
+GRID_HISTORY_LENGTH = int(_cfg("pipeline", "grid_history_length", "40"))
 
 # Live camera params
 LIVE_CAMERA_INDEX = int(_cfg("live", "camera_index", "0"))
@@ -163,6 +169,8 @@ def initialize_pipeline():
             tracking_method=TRACKING_METHOD,
             detector_interval=DETECTOR_INTERVAL,
             micrometers_per_pixel=MICROMETERS_PER_PIXEL,
+            show_tracking_grid=SHOW_TRACKING_GRID, grid_rows=GRID_ROWS,
+            grid_columns=GRID_COLUMNS, grid_history_length=GRID_HISTORY_LENGTH,
         )
         logger.info(
             f"Pipeline initialized successfully (device={DEVICE}, "
@@ -210,6 +218,8 @@ def process_video_async(video_path: str, job_dir: str, job_id: str):
             "tracking_quality_summary_path": results["output_paths"].get("tracking_quality_summary_path"),
             "identity_registry_path": results["output_paths"].get("identity_registry_path"),
             "identity_quality_events_path": results["output_paths"].get("identity_quality_events_path"),
+            **{key: results["output_paths"].get(key) for key in (
+                "grid_tracking_csv_path", "grid_tracking_json_path", "grid_tracking_video_path")},
             "results": results["analysis_results"],
             "video_properties": results["video_properties"],
             "timestamp": time.time(),
@@ -357,8 +367,14 @@ def get_results(job_id: str):
     if identity_events_path and os.path.exists(identity_events_path):
         identity_events_url = f"/outputs/{job_id}/{os.path.relpath(identity_events_path, os.path.join(OUTPUT_DIR, job_id)).replace(chr(92), '/')}"
 
+    grid_urls = {}
+    for key in ("grid_tracking_csv", "grid_tracking_json", "grid_tracking_video"):
+        path = job.get(key + "_path")
+        grid_urls[key] = (f"/outputs/{job_id}/{os.path.relpath(path, os.path.join(OUTPUT_DIR, job_id))}"
+                          if path and os.path.isfile(path) else None)
     return JSONResponse(
         {
+            **grid_urls,
             "job_id": job_id,
             "video": video_url,
             "inference_video": inference_url,
@@ -375,6 +391,24 @@ def get_results(job_id: str):
             "video_properties": job.get("video_properties", {}),
         }
     )
+
+
+@app.get("/diagnostics/{job_id}/sperm/{application_id}", dependencies=[Depends(verify_api_key)])
+def get_grid_coordinate_history(job_id: str, application_id: int):
+    """Video-local canonical identity lookup; also works for saved completed jobs."""
+    if application_id < 1 or not job_id or any(v in job_id for v in ("/", "\\", "..")):
+        raise HTTPException(status_code=400, detail="Invalid job or application ID")
+    from pathlib import Path
+    base = Path(OUTPUT_DIR).resolve()
+    path = (base / job_id / "meta" / "grid_tracking_coordinates.json").resolve()
+    if not path.is_relative_to(base):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Grid diagnostics not available for this job")
+    try:
+        return coordinate_history(path, application_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Canonical identity not found")
 
 
 @app.delete("/jobs/{job_id}", dependencies=[Depends(verify_api_key)])

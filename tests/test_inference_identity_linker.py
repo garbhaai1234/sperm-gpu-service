@@ -565,18 +565,18 @@ def test_unresolved_candidate_trajectory_evidence_recovers_original_identity():
     candidate = {
         "candidate_id": 1, "possible_identities": [1], "last_frame": 2,
         "observations": [
-            {"frame": 1, "center": (40.0, 10.0), "bbox": _box(40.0), "tracker_id": 31},
+            {"frame": 1, "center": (35.0, 10.0), "bbox": _box(35.0), "tracker_id": 31},
             {"frame": 2, "center": (50.0, 10.0), "bbox": _box(50.0), "tracker_id": 32},
         ],
         "byte_track_ids": [31, 32],
     }
     state["unresolved_candidates"] = {1: candidate}
-    detection = _observation(0.95, center_x=60.0, tracker_id=33)
+    detection = _observation(0.95, center_x=65.0, tracker_id=33)
     recovered = pipeline._reidentify_occluded_tracks([detection], state, 3, set(), set())
 
     assert len(recovered) == 1
     assert recovered[0][1] == 1
-    assert recovered[0][2]["unresolved_candidate_evidence"]["direction"] == (10.0, 0.0)
+    assert recovered[0][2]["unresolved_candidate_evidence"]["direction"] == (15.0, 0.0)
 
 
 def test_multi_member_overlap_recovers_with_global_one_to_one_assignment():
@@ -646,3 +646,228 @@ def test_maskrcnn_low_scores_are_separate_from_bytetrack_input():
     result = pipeline._run_maskrcnn_inference(np.zeros((32, 32, 3), dtype=np.uint8))
     assert np.allclose(result["scores"], [0.90])
     assert np.allclose(result["identity_scores"], [0.50, 0.70])
+
+
+def test_unresolved_chains_do_not_mix_simultaneous_detections():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state)
+    state["identities"][1]["state"] = state["identities"][1]["status"] = "LOST"
+    for frame in (1, 2):
+        for index, x in enumerate((12.0, 22.0)):
+            assert pipeline._defer_unresolved_new_detection(
+                _observation(0.95, x + frame, 30 + index), index, state, frame)
+    chains = list(state["unresolved_candidates"].values())
+    assert len(chains) == 2
+    assert all([row["frame"] for row in c["observations"]] == [1, 2] for c in chains)
+    assert all(c["trajectory_direction"] == (1.0, 0.0) for c in chains)
+
+
+def test_empty_frames_expire_unresolved_evidence_in_video_seconds():
+    for fps in (16.0, 30.0, 49.0):
+        pipeline, state = _pipeline(), _state()
+        state["source_fps"] = fps
+        state["unresolved_candidates"] = {1: {"last_frame": 0}}
+        pipeline._link_inference_application_ids([], state, int(fps))
+        assert 1 in state["unresolved_candidates"]
+        pipeline._link_inference_application_ids([], state, int(fps) + 1)
+        assert not state["unresolved_candidates"]
+
+
+def test_terminated_identity_cannot_be_revived_by_low_support_or_same_byte():
+    for score in (0.5, 0.95):
+        pipeline, state = _pipeline(), _state()
+        _seed_track(pipeline, state)
+        state["identities"][1]["state"] = state["identities"][1]["status"] = "TERMINATED"
+        _stub_geometry(pipeline, 0.0, 1.0)
+        result = pipeline._link_inference_application_ids(
+            [_observation(score, tracker_id=1 if score > 0.7 else None)], state, 1)
+        assert state["identities"][1]["state"] == "TERMINATED"
+        assert result[0] is None if score < 0.7 else result[0][:2] == (2, "NEW")
+
+
+def test_same_byte_recovery_uses_registry_fps_not_previous_video_fps():
+    pipeline, state = _pipeline(), _state()
+    pipeline.source_fps = 16.0
+    state["source_fps"] = 49.0
+    _seed_track(pipeline, state)
+    # This 100-frame absence is within 3 seconds only in the current video.
+    result = pipeline._link_inference_application_ids([_observation(0.95)], state, 100)
+    assert result[0][:2] == (1, "KEEP")
+
+
+def test_lost_survivor_does_not_resolve_group_from_old_confirmation():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state, frame=20)
+    _seed_track(pipeline, state, center_x=100.0, tracker_id=2, frame=20)
+    state["identities"][1]["state"] = state["identities"][1]["status"] = "LOST"
+    state["identities"][2]["state"] = state["identities"][2]["status"] = "TERMINATED"
+    state["overlap_groups"] = {1: {"overlap_group_id": 1, "identity_ids": [1, 2],
+                                  "start_frame": 10, "last_frame": 12, "state": "UNRESOLVED"}}
+    pipeline._update_overlap_group_states(state, 22)
+    assert state["overlap_groups"][1]["identity_ids"] == [1]
+    assert state["overlap_groups"][1]["state"] == "UNRESOLVED"
+    pipeline._link_inference_application_ids([_observation(.95)], state, 23)
+    assert state["overlap_groups"][1]["state"] == "RESOLVED"
+
+
+def test_expired_group_is_never_reopened_by_a_new_merged_observation():
+    pipeline, state = _pipeline(), _state()
+    pipeline._link_inference_application_ids([_observation(.95, 10, 1), _observation(.95, 90, 2)], state, 0)
+    expired = {"overlap_group_id": 1, "identity_ids": [1, 2], "start_frame": -10,
+               "last_frame": -5, "state": "EXPIRED", "merged_detection_indices": []}
+    state["overlap_groups"] = {1: expired}
+    state["next_overlap_group_id"] = 2
+    pipeline._link_inference_application_ids([_observation(.95, 50, 3, width=100)], state, 1)
+    assert expired["state"] == "EXPIRED"
+    assert expired["last_frame"] == -5
+    assert not expired["merged_detection_indices"]
+    assert 2 in state["overlap_groups"]
+
+
+def test_visible_but_rejected_byte_does_not_prevent_time_based_expiry():
+    for fps in (16.0, 30.0, 49.0):
+        pipeline, state = _pipeline(), _state()
+        state["source_fps"] = fps
+        _seed_track(pipeline, state)
+        pipeline._update_occlusion_states([_observation(.95, 500)], state, int(3 * fps) + 1)
+        assert state["identities"][1]["state"] == "TERMINATED"
+
+
+def test_unresolved_evidence_is_retired_when_original_byte_recovers():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state)
+    state["identities"][1]["state"] = state["identities"][1]["status"] = "LOST"
+    pipeline._defer_unresolved_new_detection(_observation(.95, 12), 0, state, 1)
+    result = pipeline._link_inference_application_ids([_observation(.95, 13)], state, 2)
+    assert result[0][0] == 1
+    assert not state["unresolved_candidates"]
+    archive = state["unresolved_candidate_archive"]
+    assert archive[0]["state"] == "RESOLVED"
+    assert archive[0]["resolved_application_id"] == 1
+    assert archive[0]["observations"][0]["confidence"] == .95
+
+
+def test_clear_joint_assignment_overrides_only_local_near_tie():
+    pipeline, state = _pipeline(), _state()
+    # ID 1 has a local near tie between X and Y. ID 2 can explain only Y,
+    # making A->X/B->Y the uniquely feasible complete assignment.
+    pipeline._link_inference_application_ids([_observation(.95, 0, 1), _observation(.95, 30, 2)], state, 0)
+    for identity in state["identities"].values():
+        identity["state"] = identity["status"] = "UNRESOLVED"
+    state["overlap_groups"] = {1: {"overlap_group_id": 1, "identity_ids": [1, 2],
+                                  "start_frame": 0, "last_frame": 0, "state": "UNRESOLVED"}}
+    result = pipeline._reidentify_occluded_tracks(
+        [_observation(.95, -10, 11), _observation(.95, 10, 12)], state, 1, set(), set())
+    assert {(row[0], row[1]) for row in result} == {(0, 1), (1, 2)}
+
+
+def test_predicted_exit_does_not_create_phantom_overlap_at_stale_anchor():
+    pipeline, state = _pipeline(), _state()
+    state.update(source_fps=16.129, frame_size=(1280, 1024))
+    _seed_track(pipeline, state, center_x=355.56, tracker_id=1, frame=194)
+    old = state["identities"][1]
+    old.update(state="LOST", status="LOST", trusted_center=(355.56, 936.65),
+               last_center=(355.56, 936.65), high_conf_history=[], velocity=(-3.61, 27.46))
+    _seed_track(pipeline, state, center_x=433, tracker_id=2, frame=214)
+    recent = state["identities"][2]
+    recent.update(trusted_center=(433, 914), last_center=(433, 914))
+    observation = {"tracker_id": 3, "confidence": .95, "center": (410, 937),
+                   "bbox": (300, 850, 520, 1024)}
+    state["blocked_high_detections"] = set()
+    pipeline._mark_merged_occlusion_observations([observation], state, 215)
+    assert not state["blocked_high_detections"]
+    assert not state["overlap_groups"]
+
+
+def test_self_consistent_unresolved_chain_cannot_bridge_unrelated_old_identity():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state, center_x=608.37, width=130, frame=0)
+    identity = state["identities"][1]
+    identity.update(state="UNRESOLVED", status="UNRESOLVED")
+    candidate = {"candidate_id": 1, "possible_identities": [1], "last_frame": 7,
+                 "observations": [
+                     {"frame": 4, "center": (880.11, 10), "bbox": _box(880.11, width=100), "tracker_id": 23},
+                     {"frame": 7, "center": (812.01, 10), "bbox": _box(812.01, width=120), "tracker_id": 29}],
+                 "byte_track_ids": [23, 29]}
+    state["unresolved_candidates"] = {1: candidate}
+    detection = _observation(.95, 812.30, 29, width=120)
+    assert pipeline._unresolved_candidate_trajectory_evidence(detection, 1, state, 8) is None
+    assert pipeline._reidentify_occluded_tracks([detection], state, 8, set(), set()) == []
+
+
+def test_sustained_ambiguous_overlap_expires_at_same_video_time_for_all_fps():
+    for fps in (16, 30, 49):
+        pipeline, state = _pipeline(), _state()
+        state["source_fps"] = fps
+        pipeline._link_inference_application_ids(
+            [_observation(.95, 10, 1), _observation(.95, 90, 2)], state, 0)
+        for frame in range(1, 3 * fps + 1):
+            result = pipeline._link_inference_application_ids(
+                [_observation(.95, 50, 3, width=100)], state, frame)
+            assert result == [None]
+            assert state["next_id"] == 3
+        pipeline._link_inference_application_ids([], state, 3 * fps + 1)
+        assert all(i["state"] == "TERMINATED" for i in state["identities"].values())
+        assert all(g["state"] == "EXPIRED" for g in state["overlap_groups"].values())
+        assert all(len({r["frame"] for r in c["observations"]}) == len(c["observations"])
+                   for c in state["unresolved_candidates"].values())
+
+
+def test_existing_candidate_cannot_acquire_a_different_possible_identity():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state, center_x=10, tracker_id=1)
+    state["identities"][1]["state"] = state["identities"][1]["status"] = "LOST"
+    pipeline._defer_unresolved_new_detection(_observation(.95, 12, 11), 0, state, 1)
+    state["identities"][2] = pipeline._new_inference_identity(2, _observation(.95, 20, 2), 0)
+    state["identities"][2]["state"] = state["identities"][2]["status"] = "LOST"
+    pipeline._defer_unresolved_new_detection(_observation(.95, 13, 11), 0, state, 2)
+    assert state["unresolved_candidates"][1]["possible_identities"] == [1]
+
+
+def test_confirmed_contact_persists_until_separation_at_every_video_fps():
+    for fps in (16, 30, 49):
+        pipeline, state = _pipeline(), _state()
+        state["source_fps"] = fps
+        for frame in range(fps + 1):
+            results = pipeline._link_inference_application_ids(
+                [_observation(.95, 0, 1), _observation(.95, 18, 2)], state, frame)
+            assert [row[0] for row in results] == [1, 2]
+        assert len(state["overlap_groups"]) == 1
+        group = state["overlap_groups"][1]
+        assert group["state"] == "CONTACT"
+        assert group["start_frame"] == 1 and group["last_frame"] == fps
+        results = pipeline._link_inference_application_ids(
+            [_observation(.95, -10, 1), _observation(.95, 28, 2)], state, fps + 1)
+        assert [row[0] for row in results] == [1, 2]
+        assert group["state"] == "RESOLVED"
+        pipeline._link_inference_application_ids(
+            [_observation(.95, -10, 1), _observation(.95, 28, 2)], state, fps + 2)
+        assert len(state["overlap_groups"]) == 1
+
+
+def test_frame_469_wrong_candidate_cannot_steal_plausible_original_identity():
+    pipeline, state = _pipeline(), _state()
+    _seed_track(pipeline, state, tracker_id=916, frame=465)
+    identity = state["identities"][1]
+    old_box = (420.926392, 92.620331, 504.491516, 190.345856)
+    old_center = (462.708954, 141.483093)
+    identity.update(status="LOST", state="LOST", last_bbox=old_box,
+                    trusted_bbox=old_box, last_high_conf_bbox=old_box,
+                    last_center=old_center, trusted_center=old_center,
+                    last_high_conf_center=old_center, high_conf_history=[])
+    state["unresolved_candidates"] = {1: {
+        "candidate_id": 1, "possible_identities": [1], "last_frame": 468,
+        "observations": [
+            {"frame": 466, "center": (389.257202, 185.548096),
+             "bbox": (375.284515, 102.333344, 403.229889, 268.762848), "tracker_id": 996},
+            {"frame": 468, "center": (387.371429, 310.700768),
+             "bbox": (374.371887, 234.708237, 400.370972, 386.693298), "tracker_id": 1011}],
+        "byte_track_ids": [996, 1011]}}
+    correct = {"tracker_id": 1014, "confidence": .967,
+               "center": (426.700012, 123.435358),
+               "bbox": (384.956665, 50.099781, 468.443359, 196.770935)}
+    wrong = {"tracker_id": 1011, "confidence": .842,
+             "center": (387.394623, 373.529922),
+             "bbox": (373.884064, 294.463654, 400.905182, 452.596191)}
+    recovered = pipeline._reidentify_occluded_tracks([correct, wrong], state, 469, set(), set())
+    assert [(r[0], r[1]) for r in recovered] == [(0, 1)]

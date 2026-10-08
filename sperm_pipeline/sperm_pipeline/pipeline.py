@@ -16,6 +16,7 @@ import logging
 from collections import defaultdict
 from itertools import permutations
 
+from .grid_tracking import GridConfig, GridDiagnostics
 from .detection import SpermDetector
 from .tracking import CSRTConfig, CSRTSpermTracker, SpermTracker
 from .segmentation import SpermSegmentation
@@ -81,7 +82,10 @@ class SpermAnalysisPipeline:
                  tracking_method: str = "distance",
                  detector_interval: int = 10,
                  csrt_config: Optional[CSRTConfig] = None,
-                 micrometers_per_pixel: Optional[float] = None):
+                 micrometers_per_pixel: Optional[float] = None,
+                 show_tracking_grid: bool = False,
+                 grid_rows: int = 8, grid_columns: int = 8,
+                 grid_history_length: int = 40):
         """
         Initialize the complete sperm analysis pipeline
         
@@ -103,6 +107,8 @@ class SpermAnalysisPipeline:
             csrt_config: Optional CSRT parameter set
             micrometers_per_pixel: Measured µm per pixel. None until calibrated.
         """
+        self.grid_config = GridConfig(show_tracking_grid, grid_rows, grid_columns, grid_history_length)
+        self.grid_paths = {}
         self.device = device
         self.frame_skip = frame_skip
         self.morph_every_n = morph_every_n
@@ -185,6 +191,7 @@ class SpermAnalysisPipeline:
 
     def _reset_run_state(self):
         """Reset mutable state before processing a new video."""
+        self.grid_paths = {}
         self.tracker.reset()
         self.trajectories = {}
         self.morphology_results = {}
@@ -794,6 +801,8 @@ class SpermAnalysisPipeline:
             width, height, fps, identity_capacity=None
         )
         csrt_identity_state["application_by_tracker"] = {}
+        grid = GridDiagnostics(os.path.basename(os.path.normpath(output_dir)), width, height, fps,
+                               getattr(self, "grid_config", GridConfig()))
         metadata_rows: List[Dict] = []
         frame_index = 0
         frames_written = 0
@@ -845,6 +854,12 @@ class SpermAnalysisPipeline:
                 if is_morphology and segments:
                     self._analyze_morphology_for_frame(frame, detections, segments)
 
+                grid_items, grid_state = self._csrt_grid_snapshot(
+                    detections, tracker, csrt_identity_state, is_detector
+                )
+                grid.capture(frame_index, grid_items,
+                             [(d["application_id"], "CSRT_UPDATE", "existing CSRT canonical assignment") for d in grid_items],
+                             grid_state, tracker_kind="csrt")
                 output = frame.copy()
                 for detection in detections:
                     if detection.get("track_id") is None:
@@ -908,6 +923,7 @@ class SpermAnalysisPipeline:
             video_path, meta_dir, fps, width, height, frames_written,
             metadata_rows, csrt_identity_state,
         )
+        self._finish_grid_diagnostics(grid, video_path, output_dir)
         self.inference_video_path = self._convert_to_mp4(temp_path)
         logger.info(
             f"CSRT inference video generation complete: {frames_written} frames written; "
@@ -1037,6 +1053,20 @@ class SpermAnalysisPipeline:
                 bbox = identity.get("trusted_bbox", identity.get("last_high_conf_bbox", identity.get("last_bbox")))
                 if anchor is None or bbox is None:
                     continue
+                anchor_frame = identity.get("last_high_conf_frame", identity.get("last_frame", frame_index))
+                gap = int(frame_index) - int(anchor_frame)
+                if gap > self._identity_recovery_window_frames(state.get("source_fps")):
+                    continue
+                # An absent member's old box is not current overlap evidence.
+                # In particular, an extrapolated exit from the field must not
+                # turn a different sperm at that old location into a merge.
+                if gap > 1:
+                    velocity = self._recent_inference_velocity(identity)
+                    predicted = (anchor[0] + velocity[0] * gap, anchor[1] + velocity[1] * gap)
+                    width, height = state.get("frame_size", (None, None))
+                    if (width is not None and height is not None
+                            and not (0 <= predicted[0] < width and 0 <= predicted[1] < height)):
+                        continue
                 center_inside = x1 <= anchor[0] <= x2 and y1 <= anchor[1] <= y2
                 if center_inside:
                     participants.append(int(app_id))
@@ -1046,7 +1076,7 @@ class SpermAnalysisPipeline:
             item["occlusion_merged"] = True
             group = next((group for group in state["overlap_groups"].values()
                           if set(group["identity_ids"]) == set(participants)
-                          and group.get("state") != "RESOLVED"), None)
+                          and group.get("state") not in {"RESOLVED", "EXPIRED"}), None)
             if group is None:
                 group_id = int(state.setdefault("next_overlap_group_id", 1))
                 state["next_overlap_group_id"] = group_id + 1
@@ -1121,7 +1151,7 @@ class SpermAnalysisPipeline:
                         continue
                     group = next((g for g in state["overlap_groups"].values()
                                   if set(g["identity_ids"]) == {left_id, right_id}
-                                  and g.get("state") != "RESOLVED"), None)
+                                  and g.get("state") not in {"RESOLVED", "EXPIRED"}), None)
                     if group is None:
                         group_id = int(state.setdefault("next_overlap_group_id", 1))
                         state["next_overlap_group_id"] = group_id + 1
@@ -1167,9 +1197,6 @@ class SpermAnalysisPipeline:
         for app_id, identity in identities.items():
             if identity.get("status") == "TERMINATED":
                 continue
-            byte_id = identity.get("current_byte_id")
-            if byte_id is not None and int(byte_id) in visible_bytes:
-                continue
             last_frame = identity.get("last_high_conf_frame", identity.get("last_frame"))
             if last_frame is None:
                 continue
@@ -1182,6 +1209,9 @@ class SpermAnalysisPipeline:
                     identity["state"] = "TERMINATED"
                     self._record_lifecycle_event(state, frame_index, "ID_TERMINATED", app_id,
                                                  last_reliable_frame=last_frame, frame_gap=gap)
+                continue
+            byte_id = identity.get("current_byte_id")
+            if byte_id is not None and int(byte_id) in visible_bytes:
                 continue
             center = identity.get("last_high_conf_center", identity.get("last_center"))
             bbox = identity.get("last_high_conf_bbox", identity.get("last_bbox"))
@@ -1244,6 +1274,7 @@ class SpermAnalysisPipeline:
             # a terminated partner no longer makes the group ambiguous.
             lone_member_recovered = (
                 len(active_ids) == 1
+                and members[0].get("state", members[0].get("status")) == "CONFIRMED"
                 and int(members[0].get("last_high_conf_frame", -1))
                 > int(group.get("last_frame", group.get("start_frame", -1)))
             )
@@ -1252,6 +1283,28 @@ class SpermAnalysisPipeline:
                 and member.get("last_seen_frame") == int(frame_index)
                 for member in members
             )
+            still_in_contact = False
+            if all_confirmed_now and len(members) > 1:
+                for pos, left in enumerate(members):
+                    for right in members[pos + 1:]:
+                        left_box = left.get("trusted_bbox", left.get("last_high_conf_bbox"))
+                        right_box = right.get("trusted_bbox", right.get("last_high_conf_bbox"))
+                        left_center = left.get("trusted_center", left.get("last_high_conf_center"))
+                        right_center = right.get("trusted_center", right.get("last_high_conf_center"))
+                        if any(value is None for value in (left_box, right_box, left_center, right_center)):
+                            continue
+                        scale = max(1.0, left_box[2] - left_box[0], left_box[3] - left_box[1],
+                                    right_box[2] - right_box[0], right_box[3] - right_box[1])
+                        distance = float(np.hypot(left_center[0] - right_center[0],
+                                                  left_center[1] - right_center[1]))
+                        if distance <= scale * 0.75 or self._bbox_iou(left_box, right_box) > 0.05:
+                            still_in_contact = True
+                if still_in_contact:
+                    # Confirmation is not separation. Keep one physical contact
+                    # episode instead of resolving/recreating it every frame.
+                    group["state"] = "CONTACT"
+                    group["last_frame"] = int(frame_index)
+                    continue
             if all_confirmed_now or lone_member_recovered:
                 group["state"] = "RESOLVED"
                 group["resolved_frame"] = int(frame_index)
@@ -1267,7 +1320,9 @@ class SpermAnalysisPipeline:
                     "resolution": group["resolution"],
                 })
             elif int(frame_index) > int(group.get("last_frame", frame_index)):
-                group.setdefault("unresolved_frames", []).append(int(frame_index))
+                frames = group.setdefault("unresolved_frames", [])
+                if not frames or frames[-1] != int(frame_index):
+                    frames.append(int(frame_index))
 
     def _reidentify_occluded_tracks(self, observations, state, frame_index, reserved_det, reserved_app):
         """Match recent lost IDs to high detections; reject close competing explanations."""
@@ -1477,6 +1532,30 @@ class SpermAnalysisPipeline:
                     "best_cost": best[0] if best else None,
                     "second_best_cost": min(alternatives) if alternatives else None,
                 })
+            else:
+                # Local near-ties are not group ambiguity when the complete
+                # assignment has a clear winner. Only override local rejection
+                # for an isolated group: competing outside identities/groups
+                # must retain the conservative global ambiguity protection.
+                isolated = (
+                    all(app in group_ids for index in relevant_dets
+                        for _, app, _ in candidates_by_detection.get(index, []))
+                    and not any(
+                        other is not group
+                        and other.get("state") not in {"RESOLVED", "EXPIRED"}
+                        and set(other.get("identity_ids", [])).intersection(group_ids)
+                        for other in state.get("overlap_groups", {}).values()
+                    )
+                )
+                if isolated:
+                    ambiguous_ids.difference_update(group_ids)
+                    ambiguous_detections.difference_update(relevant_dets)
+                    chosen = {relevant_dets[col]: group_ids[row] for row, col in best[1]}
+                    for index in relevant_dets:
+                        candidates_by_detection[index] = [
+                            edge for edge in candidates_by_detection[index]
+                            if edge[1] == chosen[index]
+                        ]
 
         for index in sorted(ambiguous_detections):
             options = sorted(candidates_by_detection.get(index, []), key=lambda row: row[0])
@@ -1548,6 +1627,28 @@ class SpermAnalysisPipeline:
             # bias a group assignment toward either member.
             if len(history) < 2:
                 continue
+            identity = state.get("identities", {}).get(application_id, {})
+            anchor = identity.get("trusted_center", identity.get("last_high_conf_center"))
+            anchor_box = identity.get("trusted_bbox", identity.get("last_high_conf_bbox"))
+            anchor_frame = identity.get("last_high_conf_frame")
+            if anchor is None or anchor_box is None or anchor_frame is None:
+                continue
+            # Candidate self-consistency is not evidence that it belongs to
+            # this old identity. Its first point must be spatially anchored to
+            # that identity, inside the existing maximum recovery envelope.
+            first = history[0]
+            first_gap = int(first["frame"]) - int(anchor_frame)
+            if first_gap < 1:
+                continue
+            first_limit = min(self.INFERENCE_APP_ID_REID_MAX_DISTANCE,
+                self.INFERENCE_APP_ID_REID_BASE_DISTANCE
+                + self.INFERENCE_APP_ID_REID_DISTANCE_PER_FRAME * first_gap)
+            first_distance = float(np.hypot(first["center"][0] - anchor[0],
+                                             first["center"][1] - anchor[1]))
+            if (first_distance > first_limit
+                    or self._bbox_long_side_ratio(first["bbox"], anchor_box)
+                    > self.INFERENCE_APP_ID_REASSOC_MAX_SIDE_RATIO):
+                continue
             previous = history[-1]
             gap = int(frame_index) - int(previous["frame"])
             if gap < 1 or gap > lifetime:
@@ -1594,18 +1695,57 @@ class SpermAnalysisPipeline:
                 return "TRUE_NEW_ENTRANT"
         return "NO_PREVIOUS_CANDIDATE"
 
-    def _defer_unresolved_new_detection(self, item, detection_index, state, frame_index):
-        """Delay ID creation when a recent lost/occluded identity remains plausible."""
+    def _expire_unresolved_candidates(self, state, frame_index):
+        """Age pending evidence on every frame, including frames without detections."""
         fps = max(1.0, float(state.get("source_fps") or 30.0))
         pending = state.setdefault("unresolved_candidates", {})
         lifetime = max(1, int(round(self.INFERENCE_APP_ID_UNRESOLVED_CANDIDATE_SECONDS * fps)))
         for key in list(pending):
             if int(frame_index) - int(pending[key]["last_frame"]) > lifetime:
+                candidate = pending[key]
+                candidate["state"] = "EXPIRED"
+                candidate["end_frame"] = int(frame_index)
+                state.setdefault("unresolved_candidate_archive", []).append(candidate)
                 state.setdefault("quality_events", []).append({
                     "frame": int(frame_index), "event": "UNRESOLVED_CANDIDATE_EXPIRED",
                     "candidate_id": int(key),
                 })
                 del pending[key]
+
+    def _resolve_unresolved_candidate(self, state, item, application_id, frame_index, metrics):
+        """Retire evidence only when this accepted observation identifies its chain."""
+        pending = state.get("unresolved_candidates", {})
+        evidence = (metrics or {}).get("unresolved_candidate_evidence")
+        candidates = []
+        for key, candidate in pending.items():
+            if application_id not in candidate.get("possible_identities", []):
+                continue
+            if int(candidate["last_frame"]) >= int(frame_index):
+                continue
+            history = candidate.get("observations", [])
+            same_byte = (history and item.get("tracker_id") is not None
+                         and history[-1].get("tracker_id") == item["tracker_id"])
+            if same_byte or (evidence and key == evidence["candidate_id"]):
+                candidates.append(key)
+        # Multiple plausible chains are still ambiguous evidence, even if the
+        # current detection itself could be assigned safely.
+        if len(candidates) != 1:
+            return
+        key = candidates[0]
+        candidate = pending.pop(key)
+        candidate.update(state="RESOLVED", end_frame=int(frame_index),
+                         resolved_application_id=int(application_id))
+        state.setdefault("unresolved_candidate_archive", []).append(candidate)
+        state.setdefault("quality_events", []).append({
+            "frame": int(frame_index), "event": "UNRESOLVED_CANDIDATE_RESOLVED",
+            "candidate_id": int(key), "application_id": int(application_id),
+            "observed_frames": len(candidate.get("observations", [])),
+        })
+
+    def _defer_unresolved_new_detection(self, item, detection_index, state, frame_index):
+        """Delay ID creation when a recent lost/occluded identity remains plausible."""
+        self._expire_unresolved_candidates(state, frame_index)
+        pending = state.setdefault("unresolved_candidates", {})
 
         plausible_ids = []
         for app_id, identity in state.get("identities", {}).items():
@@ -1641,7 +1781,12 @@ class SpermAnalysisPipeline:
         # Keep a bounded temporal record for subsequent recovery attempts.
         candidate_key = None
         for key, candidate in pending.items():
-            if int(frame_index) - int(candidate["last_frame"]) > lifetime:
+            # A trajectory may contain at most one detection per frame. Mixing
+            # simultaneous boxes invents motion and destroys directional evidence.
+            if int(candidate["last_frame"]) >= int(frame_index):
+                continue
+            if not set(candidate.get("possible_identities", [])).intersection(
+                    entry["application_id"] for entry in plausible_ids):
                 continue
             old_center = candidate["last_center"]
             old_bbox = candidate["last_bbox"]
@@ -1684,9 +1829,10 @@ class SpermAnalysisPipeline:
             if not history_ids or history_ids[-1].get("tracker_id") != int(byte_id):
                 history_ids.append({"frame": int(frame_index), "tracker_id": int(byte_id)})
             candidate["byte_track_ids"] = sorted({row["tracker_id"] for row in history_ids})
+        possible = {entry["application_id"] for entry in plausible_ids}
+        previous_possible = set(candidate.get("possible_identities", []))
         candidate["possible_identities"] = sorted(
-            {entry["application_id"] for entry in plausible_ids}
-        )
+            possible.intersection(previous_possible) if previous_possible else possible)
         item["identity_state"] = "UNRESOLVED"
         item["unresolved_candidate_id"] = int(candidate_key)
         state.setdefault("quality_events", []).append({
@@ -1810,20 +1956,61 @@ class SpermAnalysisPipeline:
         }
 
     def _write_overlap_identity_review(self, video_path, meta_dir, fps, rows, lifecycle, frame_count):
-        """Write before/during/after contact sheets for up to 20 overlap events."""
+        """Select visible contact/approach evidence, not occlusion labels alone."""
         review_dir = os.path.join(meta_dir, "overlap_identity_review")
         os.makedirs(review_dir, exist_ok=True)
         events_by_frame = defaultdict(list)
         for row in lifecycle:
             if row.get("event") in {"ID_OCCLUDED", "ID_REIDENTIFIED"}:
                 events_by_frame[int(row["frame"])].append(row)
-        all_overlap_frames = sorted({frame for frame, rows_at_frame in events_by_frame.items()
-                                     if any(row.get("event") == "ID_OCCLUDED" for row in rows_at_frame)})
-        if len(all_overlap_frames) > 20:
-            indices = np.linspace(0, len(all_overlap_frames) - 1, 20, dtype=int)
-            overlap_frames = [all_overlap_frames[index] for index in indices]
-        else:
-            overlap_frames = all_overlap_frames
+        visible = defaultdict(dict)
+        for row in rows:
+            visible[int(row["frame_index"])][int(row["application_id"])] = row
+        contact_events = []
+        previous_contact = {}
+        offset = max(1, int(round(max(1.0, float(fps)) * 0.5)))
+        for frame, detections in sorted(visible.items()):
+            ids = sorted(detections)
+            for pos, left in enumerate(ids):
+                for right in ids[pos + 1:]:
+                    boxes = [tuple(float(detections[i][k]) for k in ("x1", "y1", "x2", "y2"))
+                             for i in (left, right)]
+                    iou = self._bbox_iou(*boxes)
+                    centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+                    distance = float(np.hypot(centers[0][0] - centers[1][0], centers[0][1] - centers[1][1]))
+                    scale = max(1.0, *(max(b[2] - b[0], b[3] - b[1]) for b in boxes))
+                    if iou <= 0.05 and distance > 1.5 * scale:
+                        continue
+                    pair = (left, right)
+                    if frame - previous_contact.get(pair, -100000) < offset * 2:
+                        continue
+                    before = [f for f in range(max(0, frame - offset * 2), frame)
+                              if left in visible[f] and right in visible[f]]
+                    after = [f for f in range(frame + 1, min(frame_count, frame + offset * 3))
+                             if left in visible[f] or right in visible[f]]
+                    if not before or not after:
+                        continue
+                    before_frame = min(before, key=lambda f: abs(f - (frame - offset)))
+                    after_frame = min(after, key=lambda f: abs(f - (frame + offset)))
+                    before_boxes = [tuple(float(visible[before_frame][i][k]) for k in ("x1", "y1", "x2", "y2"))
+                                    for i in (left, right)]
+                    before_centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in before_boxes]
+                    before_distance = float(np.hypot(before_centers[0][0] - before_centers[1][0],
+                                                       before_centers[0][1] - before_centers[1][1]))
+                    disappearance = any(left not in visible[f] or right not in visible[f]
+                                        for f in range(frame + 1, min(frame_count, frame + offset + 1)))
+                    if iou <= 0.05 and not (before_distance > distance + .1 * scale and disappearance):
+                        continue
+                    contact_events.append({"frame": frame, "ids": pair, "iou": iou,
+                                           "before": before_frame, "after": after_frame,
+                                           "evidence": ("two_visible_identity_boxes_in_contact" if iou > .05
+                                                        else "approach_followed_by_missing_detection")})
+                    previous_contact[pair] = frame
+        # A review pool can exceed 20: reviewers must reject samples where the
+        # physical objects are not visible instead of counting lifecycle labels.
+        if len(contact_events) > 40:
+            indices = np.linspace(0, len(contact_events) - 1, 40, dtype=int)
+            contact_events = [contact_events[index] for index in indices]
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return {"events": 0, "directory": review_dir, "error": "video_open_failed"}
@@ -1835,20 +2022,10 @@ class SpermAnalysisPipeline:
             by_identity[int(row["application_id"])].append(row)
         review_index = []
         try:
-            for event_number, event_frame in enumerate(overlap_frames, 1):
-                event_ids = {int(row["application_id"]) for row in events_by_frame[event_frame]
-                             if row.get("event") == "ID_OCCLUDED" and row.get("application_id") is not None}
-                recovered = [int(row["frame"]) for row in lifecycle
-                             if row.get("event") == "ID_REIDENTIFIED"
-                             and int(row.get("application_id", -1)) in event_ids
-                             and int(row["frame"]) > event_frame]
-                after_frame = min(recovered) if recovered else event_frame + offset
-                sample_frames = [max(0, event_frame - offset), event_frame,
-                                 min(max(0, frame_count - 1), after_frame)]
-                event_rows = [row for row in events_by_frame[event_frame]
-                              if row.get("event") == "ID_OCCLUDED"]
-                event_ids.update(int(partner) for row in event_rows
-                                 for partner in row.get("overlap_partners", []) if partner is not None)
+            for event_number, event in enumerate(contact_events, 1):
+                event_frame = event["frame"]
+                event_ids = set(event["ids"])
+                sample_frames = [event["before"], event_frame, event["after"]]
                 nearby_boxes = []
                 for sample_frame in sample_frames:
                     for row in frame_rows.get(sample_frame, []):
@@ -1856,7 +2033,7 @@ class SpermAnalysisPipeline:
                             nearby_boxes.append([float(row[k]) for k in ("x1", "y1", "x2", "y2")])
                 if nearby_boxes:
                     max_side = max(max(box[2] - box[0], box[3] - box[1]) for box in nearby_boxes)
-                    pad = max(48, int(round(max_side * 3.0)))
+                    pad = max(48, int(round(max_side)))
                     roi = (max(0, int(min(box[0] for box in nearby_boxes)) - pad),
                            max(0, int(min(box[1] for box in nearby_boxes)) - pad),
                            int(max(box[2] for box in nearby_boxes)) + pad,
@@ -1904,6 +2081,9 @@ class SpermAnalysisPipeline:
                     path = os.path.join(review_dir, f"overlap_{event_number:03d}_frame_{event_frame:06d}.jpg")
                     cv2.imwrite(path, contact)
                     review_index.append({"event_frame": event_frame, "samples": sample_frames,
+                                         "application_ids": sorted(event_ids), "contact_iou": event["iou"],
+                                         "selection_evidence": event["evidence"],
+                                         "classification": "UNCERTAIN",
                                          "contact_sheet": os.path.basename(path)})
         finally:
             cap.release()
@@ -1928,6 +2108,7 @@ class SpermAnalysisPipeline:
             json.dump({"identity_capacity": identity_state.get("identity_capacity"),
                        "allocated_identity_count": len(registry), "identities": registry,
                        "overlap_groups": list(identity_state.get("overlap_groups", {}).values()),
+                       "unresolved_candidate_archive": identity_state.get("unresolved_candidate_archive", []),
                        "unresolved_candidates": list(identity_state.get("unresolved_candidates", {}).values())},
                       registry_file, indent=2)
         quality_events_path = os.path.join(meta_dir, "application_identity_quality_events.json")
@@ -1975,8 +2156,10 @@ class SpermAnalysisPipeline:
         state["pending_new_id_rejection_rank"] = {}
         state["blocked_high_detections"] = set()
         state["high_priority_app_candidates"] = set()
+        self._expire_unresolved_candidates(state, frame_index)
         self._mark_merged_occlusion_observations(observations, state, frame_index)
         self._update_occlusion_states(observations, state, frame_index)
+        self._update_overlap_group_states(state, frame_index)
         events: List[Optional[tuple]] = [None] * len(observations)
         reserved_det = set()
         reserved_app = set()
@@ -1994,9 +2177,10 @@ class SpermAnalysisPipeline:
             if application_id is None:
                 continue
             identity = state["identities"].get(application_id)
-            if identity is None:
+            if identity is None or identity.get("status") == "TERMINATED":
                 continue
-            metrics = self._strong_continuation_metrics(item, identity, frame_index)
+            metrics = self._strong_continuation_metrics(
+                item, identity, frame_index, fps=state.get("source_fps"))
             if metrics is None:
                 rejected_metrics = self._identity_geometry(item, identity, frame_index)
                 if rejected_metrics is not None:
@@ -2073,7 +2257,7 @@ class SpermAnalysisPipeline:
             if index in reserved_det or index in state["blocked_high_detections"] or float(item.get("confidence", 0.0)) <= self.MORPHOLOGY_THRESHOLD:
                 continue
             for application_id, identity in state["identities"].items():
-                if identity.get("status") == "OCCLUDED":
+                if identity.get("status") in {"OCCLUDED", "TERMINATED"}:
                     continue
                 metrics = self._reassociation_metrics(item, identity, frame_index)
                 if metrics is None:
@@ -2434,6 +2618,7 @@ class SpermAnalysisPipeline:
         self, events, state, item, index, application_id, frame_index,
         decision, reason, metrics, update_velocity,
     ):
+        self._resolve_unresolved_candidate(state, item, application_id, frame_index, metrics)
         events[index] = (application_id, decision, reason)
         self._touch_inference_identity(
             state,
@@ -2476,6 +2661,8 @@ class SpermAnalysisPipeline:
             candidates = []
             had_geometry = False
             for application_id, identity in state["identities"].items():
+                if identity.get("status") == "TERMINATED":
+                    continue
                 if application_id in state.get("high_priority_app_candidates", set()):
                     metrics = self._low_identity_geometry(item, identity, frame_index)
                     if metrics is not None:
@@ -2680,6 +2867,8 @@ class SpermAnalysisPipeline:
             "current_center": item.get("center"),
             "previous_bbox": None if metrics is None else metrics.get("previous_bbox", metrics.get("anchor_bbox")),
             "current_bbox": item.get("bbox"),
+            "predicted_center": None if metrics is None else metrics.get("predicted_center"),
+            "unresolved_candidate_evidence": None if metrics is None else metrics.get("unresolved_candidate_evidence"),
             "best_candidate_score": best_candidate_score,
             "second_best_candidate_score": second_best_candidate_score,
             "assignment_cost": best_candidate_score,
@@ -2715,7 +2904,7 @@ class SpermAnalysisPipeline:
         state["low_score_diagnostics"].append(row)
         logger.info("low_score_identity %s", row)
 
-    def _strong_continuation_metrics(self, item: Dict, identity: Dict, frame_index: int):
+    def _strong_continuation_metrics(self, item: Dict, identity: Dict, frame_index: int, fps=None):
         if identity.get("current_byte_id") != int(item["tracker_id"]):
             return None
         metrics = self._identity_geometry(item, identity, frame_index)
@@ -2732,7 +2921,7 @@ class SpermAnalysisPipeline:
         if gap > self.INFERENCE_APP_ID_STRONG_MAX_GAP:
             distance_limit = min(100.0, 20.0 + 7.0 * gap)
             if (
-                gap <= self._identity_recovery_window_frames(getattr(self, "source_fps", None))
+                gap <= self._identity_recovery_window_frames(fps)
                 and distance <= distance_limit
                 and (metrics["speed"] <= self.LOW_SCORE_MOTION_MIN_SPEED
                      or metrics["dist_pred"] <= distance_limit)
@@ -2990,6 +3179,8 @@ class SpermAnalysisPipeline:
             width, height, fps, identity_capacity=None
         )
         mask_states: Dict[int, Dict] = {}
+        grid = GridDiagnostics(os.path.basename(os.path.normpath(output_dir)), width, height, fps,
+                               getattr(self, "grid_config", GridConfig()))
         metadata_rows: List[Dict] = []
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -3025,6 +3216,7 @@ class SpermAnalysisPipeline:
                 )
 
                 pending_labels = []
+                grid_matched_indices = set()
                 for track_idx, det_idx in track_matches.items():
                     track = tracks[track_idx]
                     x1, y1, x2, y2 = track[:4].astype(np.float32)
@@ -3067,6 +3259,7 @@ class SpermAnalysisPipeline:
                     if self.DRAW_CENTRE_DOT:
                         cv2.circle(output, (int(round(centroid[0])), int(round(centroid[1]))), 2, self.SPERM_MASK_COLOR, -1)
 
+                    grid_matched_indices.add(det_idx)
                     pending_labels.append({
                         'tracker_id': tracker_id,
                         'bbox': (float(x1), float(y1), float(x2), float(y2)),
@@ -3110,6 +3303,14 @@ class SpermAnalysisPipeline:
                 links = self._link_inference_application_ids(
                     pending_labels, identity_state, frame_index
                 )
+                # Include detector observations that never reached the linker, without IDs.
+                grid_unlinked = [dict(bbox=tuple(map(float, box)), tracker_id=None,
+                                      confidence=float(scores[index]))
+                                 for index, box in enumerate(boxes)
+                                 if index not in grid_matched_indices]
+                grid.capture(frame_index, pending_labels + grid_unlinked,
+                             links + [None] * len(grid_unlinked), identity_state,
+                             predict=self._predicted_inference_center)
                 for item, link in zip(pending_labels, links):
                     if link is None:
                         continue
@@ -3215,11 +3416,36 @@ class SpermAnalysisPipeline:
             video_path, meta_dir, fps, width, height, frames_written,
             metadata_rows, identity_state,
         )
+        self._finish_grid_diagnostics(grid, video_path, output_dir)
         self.inference_video_path = self._convert_to_mp4(temp_path)
         logger.info(
             f"Inference Mask R-CNN video generation complete: {frames_written} frames written; "
             f"metadata rows={len(metadata_rows)}"
         )
+
+    @staticmethod
+    def _csrt_grid_snapshot(detections, tracker, identity_state, is_detector):
+        """Copy CSRT provenance; image-tracker boxes are predictions, not detections."""
+        items, identities = [], {}
+        for detection in detections:
+            app = detection.get("application_id")
+            if app is None:
+                continue
+            tid = detection.get("track_id")
+            current = tracker._tracks.get(tid, {})
+            items.append(dict(detection, tracker_id=tid,
+                              coordinate_kind="observed" if is_detector else "predicted",
+                              confidence=detection.get("confidence") if is_detector else None))
+            identities[app] = {"state": str(current.get("status", "UNKNOWN")).upper()}
+        return items, dict(identity_state, identities=identities)
+
+    def _finish_grid_diagnostics(self, grid, video_path, output_dir):
+        """Export separately; no diagnostic values enter tracking, morphology or CASA."""
+        self.grid_paths = grid.write(output_dir)
+        if grid.config.show_tracking_grid:
+            path = os.path.join(output_dir, "output_grid_tracking_video.avi")
+            grid.render(video_path, path)
+            self.grid_paths["grid_tracking_video_path"] = self._convert_to_mp4(path)
 
     @staticmethod
     def _trajectories_from_inference_rows(rows, require_morphology_valid=True):
@@ -3524,6 +3750,7 @@ class SpermAnalysisPipeline:
         )
 
         return {
+            **getattr(self, 'grid_paths', {}),
             'json_path': json_path,
             'csv_path': csv_path,
             'trajectories_path': trajectories_path,
